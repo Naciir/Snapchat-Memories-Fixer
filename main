@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import re
+import json
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+from itertools import zip_longest
+
+
+def load_dotenv():
+    """Tiny .env loader (no python-dotenv dependency needed).
+    Looks in the current working directory and next to this script."""
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parent / ".env"]
+    for env_path in candidates:
+        if not env_path.is_file():
+            continue
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+        break  # first .env found wins
+
+
+load_dotenv()
+FFMPEG_BIN = os.environ.get("FFMPEG_PATH", "ffmpeg")
+
+try:
+    from PIL import Image
+except ImportError:
+    print("Missing dependency. Run: pip install Pillow piexif --break-system-packages")
+    sys.exit(1)
+
+try:
+    import piexif
+    HAVE_PIEXIF = True
+except ImportError:
+    HAVE_PIEXIF = False
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
+
+
+# ---------- pairing -main / -overlay files ----------
+
+def find_pairs(input_dir: Path):
+    groups = defaultdict(dict)
+    for f in input_dir.iterdir():
+        if not f.is_file():
+            continue
+        stem = f.stem
+        if stem.endswith("-main"):
+            groups[stem[: -len("-main")]]["main"] = f
+        elif stem.endswith("-overlay"):
+            groups[stem[: -len("-overlay")]]["overlay"] = f
+        else:
+            print(f"  (skipping, no -main/-overlay suffix: {f.name})")
+    return groups
+
+
+def extract_date_from_key(key: str):
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", key)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+# ---------- loading the JSON metadata ----------
+
+def load_metadata(json_path: Path):
+    raw = json.loads(json_path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        # e.g. {"Saved Media": [...]}  -- grab the first list value found
+        for v in raw.values():
+            if isinstance(v, list):
+                raw = v
+                break
+
+    entries = []
+    for item in raw:
+        date_str = (item.get("Date") or "").replace(" UTC", "").strip()
+        dt = None
+        if date_str:
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+
+        lat = lon = None
+        loc = item.get("Location", "") or ""
+        m = re.search(r"Latitude,\s*Longitude:\s*(-?\d+\.?\d*),\s*(-?\d+\.?\d*)", loc)
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            if lat == 0 and lon == 0:
+                lat = lon = None  # Snapchat uses 0,0 for "no location"
+
+        entries.append({
+            "date": dt,
+            "lat": lat,
+            "lon": lon,
+            "type": (item.get("Media Type") or "").strip().lower(),
+        })
+    return entries
+
+
+# ---------- image merge + metadata ----------
+
+def merge_image(main_path: Path, overlay_path: Path, out_path: Path):
+    base = Image.open(main_path).convert("RGBA")
+    overlay = Image.open(overlay_path).convert("RGBA")
+    if overlay.size != base.size:
+        overlay = overlay.resize(base.size, Image.LANCZOS)
+    merged = Image.alpha_composite(base, overlay)
+    merged.convert("RGB").save(out_path, quality=95)
+
+
+def _to_deg(value: float):
+    deg = int(value)
+    minutes_full = (value - deg) * 60
+    minute = int(minutes_full)
+    sec = round((minutes_full - minute) * 60 * 100)
+    return ((deg, 1), (minute, 1), (sec, 100))
+
+
+def embed_image_metadata(path: Path, dt, lat, lon):
+    if not HAVE_PIEXIF or path.suffix.lower() not in (".jpg", ".jpeg"):
+        return
+    if dt is None and lat is None:
+        return
+    exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+    if dt:
+        dt_str = dt.strftime("%Y:%m:%d %H:%M:%S")
+        exif_dict["0th"][piexif.ImageIFD.DateTime] = dt_str
+        exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = dt_str
+        exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = dt_str
+    if lat is not None and lon is not None:
+        exif_dict["GPS"] = {
+            piexif.GPSIFD.GPSLatitudeRef: "N" if lat >= 0 else "S",
+            piexif.GPSIFD.GPSLatitude: _to_deg(abs(lat)),
+            piexif.GPSIFD.GPSLongitudeRef: "E" if lon >= 0 else "W",
+            piexif.GPSIFD.GPSLongitude: _to_deg(abs(lon)),
+        }
+    piexif.insert(piexif.dump(exif_dict), str(path))
+
+
+# ---------- video merge + metadata ----------
+
+def merge_video(main_path: Path, overlay_path: Path, out_path: Path):
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-i", str(main_path),
+        "-i", str(overlay_path),
+        "-filter_complex",
+        "[1:v]scale2ref=w=iw:h=ih[ovl][base];[base][ovl]overlay=0:0[v]",
+        "-map", "[v]", "-map", "0:a?",
+        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+        "-c:a", "copy",
+        str(out_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2000:])
+
+
+def embed_video_metadata(path: Path, dt, lat, lon):
+    if dt is None and lat is None:
+        return
+    metadata_args = []
+    if dt:
+        metadata_args += ["-metadata", f"creation_time={dt.strftime('%Y-%m-%dT%H:%M:%S.000000Z')}"]
+    if lat is not None and lon is not None:
+        iso6709 = f"{lat:+.4f}{lon:+.4f}/"
+        metadata_args += ["-metadata", f"location={iso6709}", "-metadata", f"location-eng={iso6709}"]
+
+    tmp = path.with_suffix(".tmp.mp4")
+    cmd = [FFMPEG_BIN, "-y", "-i", str(path)] + metadata_args + [
+        "-c", "copy", "-movflags", "use_metadata_tags+faststart", str(tmp)
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        # Windows sometimes briefly locks a just-written file (Defender/Explorer
+        # scanning it) -- retry the rename a few times before giving up.
+        last_err = None
+        for attempt in range(6):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError as e:
+                last_err = e
+                time.sleep(1.5 * (attempt + 1))
+        tmp.unlink(missing_ok=True)
+        raise last_err
+    else:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(result.stderr[-1500:])
+
+
+# ---------- main ----------
+
+def main():
+    if len(sys.argv) not in (3, 4):
+        print("Usage: python3 fix_snapchat_memories.py <input_dir> <output_dir> [memories_history.json]")
+        sys.exit(1)
+
+    input_dir = Path(sys.argv[1]).expanduser().resolve()
+    output_dir = Path(sys.argv[2]).expanduser().resolve()
+    json_path = Path(sys.argv[3]).expanduser().resolve() if len(sys.argv) == 4 else None
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not input_dir.is_dir():
+        print(f"Input dir not found: {input_dir}")
+        sys.exit(1)
+    if json_path and not json_path.is_file():
+        print(f"JSON file not found: {json_path}")
+        sys.exit(1)
+    if json_path and not HAVE_PIEXIF:
+        print("Note: piexif isn't installed, so photo EXIF metadata will be skipped.")
+        print("Run: pip install piexif --break-system-packages\n")
+
+    if video_dirs_need_ffmpeg := any(f.suffix.lower() in VIDEO_EXTS for f in input_dir.iterdir() if f.is_file()):
+        if not (Path(FFMPEG_BIN).is_file() or shutil.which(FFMPEG_BIN)):
+            print(f"[WARN] Can't find ffmpeg at '{FFMPEG_BIN}'. Video merging will fail.")
+            print("       Check FFMPEG_PATH in your .env, or that ffmpeg is on PATH.\n")
+
+    print(f"Scanning {input_dir} ...")
+    groups = find_pairs(input_dir)
+    print(f"Found {len(groups)} memories.\n")
+
+    # Split into image / video / other groups, each tagged with its date
+    image_groups, video_groups, other = [], [], []
+    for key, files in groups.items():
+        main = files.get("main")
+        if not main:
+            print(f"[SKIP] {key}: only an overlay file, no main file")
+            continue
+        ext = main.suffix.lower()
+        date = extract_date_from_key(key)
+        if ext in IMAGE_EXTS:
+            image_groups.append((date, key, files))
+        elif ext in VIDEO_EXTS:
+            video_groups.append((date, key, files))
+        else:
+            other.append((key, files))
+
+    image_groups.sort(key=lambda t: (t[0] or datetime.min, t[1]))
+    video_groups.sort(key=lambda t: (t[0] or datetime.min, t[1]))
+
+    images_meta, videos_meta = [], []
+    if json_path:
+        entries = load_metadata(json_path)
+        images_meta = sorted((e for e in entries if e["type"] == "image"), key=lambda e: e["date"] or datetime.min)
+        videos_meta = sorted((e for e in entries if e["type"] == "video"), key=lambda e: e["date"] or datetime.min)
+        if len(images_meta) != len(image_groups):
+            print(f"[WARN] {len(image_groups)} photo files vs {len(images_meta)} photo entries in JSON — matching may drift.")
+        if len(videos_meta) != len(video_groups):
+            print(f"[WARN] {len(video_groups)} video files vs {len(videos_meta)} video entries in JSON — matching may drift.")
+        print()
+
+    ok, failed, no_overlay = 0, 0, 0
+
+    def process(date, key, files, meta):
+        nonlocal ok, failed, no_overlay
+        main, overlay = files["main"], files.get("overlay")
+        ext = main.suffix.lower()
+        out_ext = ".jpg" if ext in IMAGE_EXTS else ".mp4"
+        out_path = output_dir / f"{key}{out_ext}"
+        if out_path.exists() and out_path.stat().st_size > 0:
+            print(f"[SKIP] {key}{out_ext} already exists, skipping")
+            ok += 1
+            return
+        try:
+            if ext in IMAGE_EXTS:
+                if overlay:
+                    merge_image(main, overlay, out_path)
+                else:
+                    if ext in (".jpg", ".jpeg"):
+                        shutil.copy2(main, out_path)
+                    else:
+                        Image.open(main).convert("RGB").save(out_path, quality=95)
+                    no_overlay += 1
+                if meta:
+                    embed_image_metadata(out_path, meta["date"], meta["lat"], meta["lon"])
+            else:  # video
+                if overlay:
+                    merge_video(main, overlay, out_path)
+                else:
+                    shutil.copy2(main, out_path)
+                    no_overlay += 1
+                if meta:
+                    embed_video_metadata(out_path, meta["date"], meta["lat"], meta["lon"])
+            print(f"[OK]   {key}{ext}" + ("  (+metadata)" if meta else ""))
+            ok += 1
+        except Exception as e:
+            print(f"[FAIL] {key}: {e}")
+            failed += 1
+
+    for (date, key, files), meta in zip_longest(image_groups, images_meta):
+        process(date, key, files, meta)
+    for (date, key, files), meta in zip_longest(video_groups, videos_meta):
+        process(date, key, files, meta)
+    for key, files in other:
+        print(f"[SKIP] {key}: unrecognized main extension '{files['main'].suffix}'")
+        failed += 1
+
+    print("\n---- Done ----")
+    print(f"Merged/copied OK:     {ok}  (of which {no_overlay} had no overlay to merge)")
+    print(f"Failed/skipped:       {failed}")
+    print(f"Output folder: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
